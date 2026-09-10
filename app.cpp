@@ -48,7 +48,6 @@ public:
     }
 };
 
-
 std::string resolveDomain(const std::string& ipStr) {
     static std::unordered_map<std::string, std::string> dnsCache;
     static std::mutex cacheMutex;
@@ -68,7 +67,6 @@ std::string resolveDomain(const std::string& ipStr) {
     }
 
     char host[NI_MAXHOST];
-    // NI_NAMEREQD вернет ошибку, если у IP нет PTR-записи
     if (getnameinfo((struct sockaddr*)&sa, sizeof(sa), host, sizeof(host), NULL, 0, NI_NAMEREQD) == 0) {
         std::string domainName(host);
         std::lock_guard<std::mutex> lock(cacheMutex);
@@ -86,11 +84,12 @@ struct ProcessMeta {
     unsigned long pid;
     unsigned long ppid;
     std::string name;
+    std::string exePath;
 };
 
 ProcessMeta getProcessMeta(unsigned long pid) {
-    if (pid == 0) return {0, 0, "<unknown>"};
-    ProcessMeta meta = {pid, 0, "<unknown>"};
+    if (pid == 0) return {0, 0, "<unknown>", ""};
+    ProcessMeta meta = {pid, 0, "<unknown>", ""};
 
 #ifdef _WIN32
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -117,9 +116,72 @@ ProcessMeta getProcessMeta(unsigned long pid) {
             meta.name = comm.substr(1, comm.size() - 2);
         }
     }
+
+    // Получаем полный путь к бинарнику через /proc/[pid]/exe
+    char linkPath[PATH_MAX];
+    ssize_t len = readlink(("/proc/" + std::to_string(pid) + "/exe").c_str(), linkPath, sizeof(linkPath) - 1);
+    if (len != -1) {
+        linkPath[len] = '\0';
+        meta.exePath = std::string(linkPath);
+    }
 #endif
     return meta;
 }
+
+
+class AnomalyDetector {
+public:
+    static void analyzeProcessLaunch(const ProcessMeta& child, const ProcessMeta& parent) {
+        std::string pName = parent.name;
+        std::string cName = child.name;
+
+        // Приведение имен к нижнему регистру для надежности
+        std::transform(pName.begin(), pName.end(), pName.begin(), ::tolower);
+        std::transform(cName.begin(), cName.end(), cName.begin(), ::tolower);
+
+        // Правило 1: Браузер запускает оболочку командной строки
+        if ((pName.find("firefox") != std::string::npos || pName.find("chrome") != std::string::npos) &&
+            (cName == "bash" || cName == "sh" || cName == "cmd.exe" || cName == "powershell.exe")) {
+            
+            std::stringstream alert;
+            alert << "🚨 [ANOMALY_ALERT] Suspicious Browser Process Chain! "
+                  << "Parent Browser: [" << parent.name << " (PID: " << parent.pid << ")] "
+                  << "spawned Shell: [" << child.name << " (PID: " << child.pid << ")]";
+            Logger::log(alert.str());
+        }
+
+        // Правило 2: Офисный документ или просмотрщик запускает командный интерпретатор
+        if ((pName.find("soffice") != std::string::npos || pName.find("winword") != std::string::npos || pName.find("excel") != std::string::npos) &&
+            (cName == "bash" || cName == "sh" || cName == "cmd.exe" || cName == "powershell.exe")) {
+            
+            std::stringstream alert;
+            alert << "🚨 [ANOMALY_ALERT] Suspicious Office Macro Activity! "
+                  << "Parent App: [" << parent.name << "] spawned Shell: [" << child.name << "]";
+            Logger::log(alert.str());
+        }
+
+        // Правило 3: Веб-сервер запускает интерактивную оболочку (RCE / Web Shell)
+        if ((pName.find("nginx") != std::string::npos || pName.find("apache") != std::string::npos || pName.find("httpd") != std::string::npos) &&
+            (cName == "bash" || cName == "sh" || cName == "python" || cName == "php")) {
+            
+            std::stringstream alert;
+            alert << "🚨 [ANOMALY_ALERT] Possible Web Shell / RCE Execution! "
+                  << "Web Server: [" << parent.name << "] spawned Execution Shell: [" << child.name << "]";
+            Logger::log(alert.str());
+        }
+
+        // Правило 4: Исполняемый файл запущен из временной директории (/tmp или /dev/shm)
+        if (!child.exePath.empty()) {
+            if (child.exePath.rfind("/tmp/", 0) == 0 || child.exePath.rfind("/dev/shm/", 0) == 0) {
+                std::stringstream alert;
+                alert << "🚨 [ANOMALY_ALERT] Execution from Temporary Directory! "
+                      << "App: [" << child.name << " (PID: " << child.pid << ")] "
+                      << "Path: " << child.exePath;
+                Logger::log(alert.str());
+            }
+        }
+    }
+};
 
 
 class ProcessWatcher {
@@ -142,9 +204,16 @@ public:
                     currentPids[pid] = name;
 
                     if (knownPids.find(pid) == knownPids.end()) {
+                        ProcessMeta childMeta = {pid, ppid, name, ""};
+                        ProcessMeta parentMeta = getProcessMeta(ppid);
+
                         std::stringstream msg;
-                        msg << "[⚙️ PROC_LAUNCH]  PID: " << pid << " | Parent PID: " << ppid << " | App: [" << name << "]";
+                        msg << "[⚙️ PROC_LAUNCH]  PID: " << pid << " | Parent PID: " << ppid 
+                            << " (" << parentMeta.name << ") | App: [" << name << "]";
                         Logger::log(msg.str());
+
+                        // Проверка на аномальность цепочки
+                        AnomalyDetector::analyzeProcessLaunch(childMeta, parentMeta);
                     }
                 } while (Process32Next(hSnapshot, &pe32));
             }
@@ -156,13 +225,19 @@ public:
             if (!std::all_of(name.begin(), name.end(), ::isdigit)) continue;
 
             unsigned long pid = std::stoul(name);
-            ProcessMeta meta = getProcessMeta(pid);
-            currentPids[pid] = meta.name;
+            ProcessMeta childMeta = getProcessMeta(pid);
+            currentPids[pid] = childMeta.name;
 
             if (knownPids.find(pid) == knownPids.end()) {
+                ProcessMeta parentMeta = getProcessMeta(childMeta.ppid);
+
                 std::stringstream msg;
-                msg << "[⚙️ PROC_LAUNCH]  PID: " << pid << " | Parent PID: " << meta.ppid << " | App: [" << meta.name << "]";
+                msg << "[⚙️ PROC_LAUNCH]  PID: " << pid << " | Parent PID: " << childMeta.ppid 
+                    << " (" << parentMeta.name << ") | App: [" << childMeta.name << "]";
                 Logger::log(msg.str());
+
+                // Проверка на аномальность цепочки процессов
+                AnomalyDetector::analyzeProcessLaunch(childMeta, parentMeta);
             }
         }
 #endif
@@ -383,7 +458,7 @@ int main() {
     Logger::init();
 
     Logger::log("=================================================================");
-    Logger::log("  EDR Agent Active: Clean Categories & Domain Resolution Enabled");
+    Logger::log("  EDR Agent Active: Process Anomaly Detector & Heuristics ON");
     Logger::log("=================================================================\n");
 
     std::string currentPath = fs::current_path().string();
@@ -397,7 +472,7 @@ int main() {
     procWatcher.scan();
     netWatcher.scan();
 
-    Logger::log("[i] Monitoring active...\n");
+    Logger::log("[i] EDR Sensor ready. Monitoring active...\n");
 
     while (true) {
         procWatcher.scan();
